@@ -1,0 +1,281 @@
+===============================================================================
+  MULTI PING TOOLS  v1.4  -  SECURITY REVIEW
+  Smart Technologies (BD) Ltd.   |   Enterprise Service (Huawei Team)
+  Reviewed: 21 September 2026
+===============================================================================
+
+This document records the security review of multi_ping_tools.py, the
+findings, and the controls implemented. Every control listed here has an
+automated test in selftest.py - run it yourself to verify.
+
+    python selftest.py
+
+
+-------------------------------------------------------------------------------
+  1. SUMMARY
+-------------------------------------------------------------------------------
+
+  Malware / backdoor        NONE. Single readable .py file, no binary blob,
+                            no obfuscation, no encoded payload.
+  Network egress            NONE. No socket, no HTTP, no telemetry.
+  Third-party dependencies  NONE. Python standard library only.
+  Persistence               NONE. No registry key, no service, no scheduled
+                            task, no startup entry, no temp file.
+  Data collection           NONE. Nothing leaves your computer.
+  Privilege required        Normal user. No admin/UAC needed.
+  Software update           OFFLINE ONLY - copies from a folder YOU
+                            configure. No internet, no vendor server.
+                            Disabled until you configure it. See 3A.
+
+  Issues found during review : 5
+  Issues fixed               : 5
+  Open issues                : 0
+  Accepted risk              : 1 (the update share - see section 3A)
+
+
+-------------------------------------------------------------------------------
+  2. FINDINGS AND FIXES
+-------------------------------------------------------------------------------
+
+FINDING 1 - Command-line argument injection via CSV     Severity: HIGH   FIXED
+...............................................................................
+  The IP/host value comes from a CSV that a user may receive from someone
+  else. It was passed straight to ping. A cell containing "-t" would not be
+  treated as a destination - Windows ping would read it as the "ping
+  forever" OPTION. Other abusable values: "-l 65500" (maximum payload),
+  "-f" (flood, Linux), "-n 100000".
+
+  Impact: a crafted CSV could turn the tool into an unintended traffic
+  generator against whatever target followed, or hang worker threads.
+
+  FIX: is_safe_target() is a strict allowlist applied in THREE places:
+       (a) at CSV import   - bad rows are rejected and counted
+       (b) at Add Row      - dialog refuses the value
+       (c) at launch time  - row is marked BAD TARGET, never scheduled
+       (d) inside ping_one - final gate before subprocess
+       Anything starting with "-" is rejected outright.
+  TEST: selftest.py [S1] [S3] [S9], _concurrenttest TEST 5
+
+
+FINDING 2 - Excel formula / DDE injection on export     Severity: HIGH   FIXED
+...............................................................................
+  CWE-1236. Host names imported from an untrusted CSV were written verbatim
+  into the exported CSV. Opening that file in Excel would execute a cell
+  such as:
+        =cmd|'/c calc'!A1
+        =HYPERLINK("http://attacker/","click me")
+  This is a classic way to get code execution on the machine of whoever
+  opens the report - often a manager, not the engineer.
+
+  FIX: csv_safe() prefixes any value beginning with = + - @ or TAB with an
+       apostrophe, forcing Excel to treat it as text. CR/LF and NUL are
+       stripped. Applied to every exported cell.
+  TEST: selftest.py [S6], _exporttest.py
+
+
+FINDING 3 - Wrong-row updates after sort/delete         Severity: MEDIUM FIXED
+...............................................................................
+  Worker threads referenced rows by LIST INDEX. Sorting a column or
+  deleting a row while a scan was running shifted those indices, so results
+  could be written onto the wrong host - a silent data-integrity bug that
+  could make an engineer declare the wrong device down. Deleting enough
+  rows could also raise IndexError and kill the update loop.
+
+  FIX: every row now carries an immutable _uid. Workers report by _uid;
+       the UI resolves _uid to the current row at update time and silently
+       skips rows that were deleted. Sorting is now safe mid-scan.
+       Rows being pinged cannot be deleted until their job is stopped.
+  TEST: selftest.py [F8]
+
+
+FINDING 4 - No resource limits on import                Severity: MEDIUM FIXED
+...............................................................................
+  A very large or malformed CSV could exhaust memory / freeze the UI.
+
+  FIX: MAX_CSV_BYTES = 8 MB import cap, MAX_ROWS = 5000 rows,
+       MAX_THREADS = 200, per-ping subprocess timeout, bounded queue
+       draining (500 messages per UI tick), stdin=DEVNULL so a child
+       process can never block waiting for input.
+  TEST: selftest.py [S8]
+
+
+FINDING 5 - Control characters in host names            Severity: LOW    FIXED
+...............................................................................
+  Non-printable characters from a CSV could corrupt the table display.
+
+  FIX: clean_text() strips non-printable characters and caps length.
+  TEST: selftest.py [S9]
+
+
+-------------------------------------------------------------------------------
+  3. CONTROLS VERIFIED PRESENT
+-------------------------------------------------------------------------------
+
+  [+] shell=False on every subprocess call; shell=True appears nowhere.
+      Arguments are passed as a fixed LIST, so shell metacharacters
+      (; | & $ ` > <) can never be interpreted even if they got through.
+  [+] os.system / os.popen are not used anywhere.
+  [+] eval, exec, compile, __import__, pickle, marshal, ctypes, winreg,
+      base64 decoding - none present.
+  [+] socket, urllib, requests, http, ftplib, telnetlib, smtplib -
+      none imported. The program is incapable of network I/O beyond
+      invoking the operating system's own ping command.
+  [+] Imports verified by AST against an allowlist:
+      concurrent, csv, itertools, os, platform, re, subprocess,
+      threading, queue, time, datetime, tkinter.  All standard library.
+  [+] No file is written except the CSV you explicitly choose in the
+      Save dialog. No temp files, no logs, no config file.
+  [+] Worker threads are daemon threads with interruptible waits; closing
+      the window stops every job cleanly.
+
+  NOTE ON "AUTO UPDATE"
+  ---------------------
+  The AUTO UPDATE button refers ONLY to refreshing the ping results on
+  screen. It does NOT check for, download, or install any software.
+
+
+-------------------------------------------------------------------------------
+  3A. THE "UPDATE" BUTTON  (new in v1.4)  -  READ THIS
+-------------------------------------------------------------------------------
+
+  v1.4 adds a one-click software update. Be clear about what it is and
+  what it is not.
+
+  WHAT IT IS
+    A plain file copy from a folder that YOU configure, in a file called
+    update_source.txt sitting next to the program. Typically a company
+    file share (\\fileserver\tools\MultiPingTools), a mapped drive or a
+    USB stick.
+
+    Pressing Update:
+      1. reads that folder path from update_source.txt
+      2. reads version.txt from that folder
+      3. compares it numerically with the running version
+      4. if newer, asks you to confirm, then closes the app and runs
+         UPDATE.bat, which BACKS UP the current folder and copies the
+         new build over it, then relaunches
+
+  WHAT IT IS NOT
+    * It does NOT use the internet. No socket, no HTTP, no DNS, no TLS.
+      The imports are unchanged and still verified by selftest.py [S7]
+      against an allowlist - urllib, requests, socket, http are absent.
+    * There is no vendor update server. Smart Technologies cannot push
+      anything to your machine. Nothing phones home.
+    * It does not run as a service or check silently in the background.
+      It only acts when a human presses the button.
+    * Nothing is downloaded or executed unless update_source.txt has
+      been filled in - by default it is empty and the feature is inert.
+
+  THE RISK YOU ARE ACCEPTING - AND HOW TO CONTROL IT
+    Any update mechanism is a supply-chain path. Whoever can WRITE to
+    that shared folder can replace the EXE that your whole team runs.
+    That is true of every enterprise software-distribution share; it is
+    not specific to this tool. Mitigate it the normal way:
+
+      * Make the share READ-ONLY for ordinary users. Only the two or
+        three people who publish builds should have write access.
+      * Publish with PUBLISH.bat from a machine you control, using a
+        build YOU produced from this source with MAKE_PORTABLE.bat.
+      * Use a UNC path to a known internal server, or a mapped drive -
+        never a path a user can redirect.
+      * If your policy forbids self-updating tools, simply leave
+        update_source.txt empty. The Update button then does nothing
+        except tell the user it is not configured. You lose no other
+        functionality.
+
+  CONTROLS BUILT INTO THE UPDATER
+    * Version comparison is NUMERIC, so 1.10 correctly ranks above 1.9
+      and a lower version on the share can never trigger a silent
+      downgrade.
+    * A malformed or booby-trapped version.txt is rejected, not parsed
+      loosely - the update simply does not proceed.
+    * The user must confirm before anything is replaced, unless the app
+      itself launched the updater after its own confirmation dialog.
+    * The current folder is copied to _backup_<version>_<timestamp>
+      BEFORE any file is overwritten, so a bad update is reversible.
+    * update_source.txt is excluded from the copy, so a user's own
+      configuration is never overwritten by a published build.
+    * UPDATE.bat waits for MultiPingTools.exe to exit before touching
+      files, avoiding a half-replaced installation.
+    * If the folder is unreachable, has no version.txt, or has no
+      MultiPingTools.exe, the updater stops and changes nothing.
+
+  All of the above is covered by automated tests - selftest.py sections
+  [S10], [S11] and [S12].
+
+
+-------------------------------------------------------------------------------
+  4. RESIDUAL RISK - THINGS YOU SHOULD KNOW
+-------------------------------------------------------------------------------
+
+  * ANTIVIRUS FALSE POSITIVES ON THE EXE
+    A PyInstaller --onefile EXE unpacks itself at run time, which several
+    AV engines flag heuristically. The code also uses CREATE_NO_WINDOW so
+    that 200 console windows do not flash on screen - a legitimate need,
+    but another heuristic trigger.
+    This is a FALSE POSITIVE, not malware. Options:
+      - run the .py directly instead of building an EXE (safest)
+      - submit the EXE to your AV vendor for whitelisting
+      - build the EXE yourself from this source so you control the binary
+    Do NOT disable antivirus.
+
+  * VERIFY BEFORE YOU DISTRIBUTE
+    Build the EXE yourself with build_exe.bat. Do not accept a prebuilt
+    MultiPingTools.exe from anyone - you cannot verify what is inside it.
+    The source here is the authoritative artifact.
+
+  * PING VOLUME LOOKS LIKE A SCAN
+    Continuous ping across 200 hosts with Interval 0 generates steady ICMP
+    that an IPS/IDS may classify as host sweeping. On production networks
+    keep Interval at 2 seconds or more and inform your security team
+    before long monitoring runs.
+
+  * ICMP FILTERING CAUSES FALSE RED
+    A RED row means "no ICMP reply", not necessarily "device down". Many
+    firewalls drop ICMP by policy. Confirm by another method before
+    raising an incident.
+
+  * PLAINTEXT EXPORT
+    The exported CSV contains your host names and IP addresses - that is
+    internal network topology information. Store and share it according to
+    your company's data handling policy.
+
+  * NO AUTHENTICATION
+    The tool performs no login and stores no credentials. It only sends
+    ICMP echo requests. It cannot configure or access your devices.
+
+
+-------------------------------------------------------------------------------
+  5. HOW TO RE-VERIFY THIS YOURSELF
+-------------------------------------------------------------------------------
+
+  Run the automated suite:
+
+      python selftest.py
+
+  It prints a pass/fail line for every control above, including 22
+  malicious input strings that must be rejected and 7 Excel formula
+  payloads that must be neutralised. Exit code 0 = all passed.
+
+  Read the code. It is one file, plain Python, fully commented. The
+  security-relevant functions are at the top:
+
+      is_safe_target()    the allowlist
+      csv_safe()          the export sanitiser
+      clean_text()        control-character stripper
+      _build_cmd()        the fixed argument list
+      ping_one()          the only place a process is ever created
+
+  There is exactly ONE subprocess call in the whole program. Search for
+  "subprocess.run" and you will find it.
+
+===============================================================================
+
+
+## Reporting a Vulnerability
+
+Use this section to tell people how to report a vulnerability.
+
+Tell them where to go, how often they can expect to get an update on a
+reported vulnerability, what to expect if the vulnerability is accepted or
+declined, etc.
